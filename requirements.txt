@@ -1,0 +1,18 @@
+# Core dependencies
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+statsmodels>=0.13.0
+
+# For Excel file I/O
+openpyxl>=3.0.0
+
+# Optional but recommended (for enhanced performance)
+xgboost>=1.5.0
+lightgbm>=3.3.0
+
+# Note: matplotlib and seaborn are mentioned in README but not used in code
+# Uncomment if needed for visualization:
+# matplotlib>=3.5.0
+# seaborn>=0.11.0
