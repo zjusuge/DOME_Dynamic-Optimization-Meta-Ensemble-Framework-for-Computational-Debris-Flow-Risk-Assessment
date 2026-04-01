@@ -1,649 +1,1272 @@
-import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, AdaBoostRegressor, BaggingRegressor
+import pandas as pd
+
+from sklearn.base import clone
+from sklearn.ensemble import (
+    RandomForestRegressor,
+    GradientBoostingRegressor,
+    AdaBoostRegressor,
+    BaggingRegressor
+)
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
-from sklearn.svm import SVR
-from sklearn.tree import DecisionTreeRegressor
+from sklearn.feature_selection import RFE
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.model_selection import (
+    train_test_split,
+    cross_val_score,
+    cross_val_predict,
+    KFold
+)
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.feature_selection import RFE
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
 from scipy.stats import spearmanr
 from statsmodels.stats.outliers_influence import variance_inflation_factor
-import warnings
-
-warnings.filterwarnings('ignore')
 
 try:
     import xgboost as xgb
-
     XGBOOST_AVAILABLE = True
 except ImportError:
     XGBOOST_AVAILABLE = False
 
 try:
     import lightgbm as lgb
-
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     LIGHTGBM_AVAILABLE = False
 
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+
+
+def safe_mape(y_true, y_pred, epsilon=1e-8):
+    """Safely compute MAPE while avoiding division by zero."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.where(np.abs(y_true) < epsilon, epsilon, np.abs(y_true))
+    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
+
+
+def safe_spearman_correlation(y_true, y_pred):
+    """Safely compute Spearman correlation and return 0.0 when invalid."""
+    try:
+        y_true = np.asarray(y_true, dtype=float)
+        y_pred = np.asarray(y_pred, dtype=float)
+
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if mask.sum() < 2:
+            return 0.0
+
+        y_true = y_true[mask]
+        y_pred = y_pred[mask]
+
+        if np.std(y_true) == 0 or np.std(y_pred) == 0:
+            return 0.0
+
+        corr, _ = spearmanr(y_true, y_pred)
+        if np.isnan(corr):
+            return 0.0
+        return float(corr)
+    except Exception:
+        return 0.0
+
+
+def resolve_target_column(df, preferred=None, fallback_to_last=True):
+    """
+    Resolve the target column from a dataframe.
+
+    Preferred behavior:
+    1. Use user-specified column if present.
+    2. Check common susceptibility/risk target names.
+    3. Fall back to the last column if requested.
+
+    This keeps compatibility with historical spreadsheets using 'Risk_index'
+    while aligning terminology with susceptibility assessment.
+    """
+    if preferred is not None:
+        if preferred in df.columns:
+            return preferred
+        raise ValueError(
+            f"Preferred target column '{preferred}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    candidate_names = [
+        "Susceptibility_index",
+        "Susceptibility",
+        "SusceptibilityScore",
+        "Susceptibility_score",
+        "Risk_index",      # legacy compatibility
+        "label",
+        "Label",
+        "target",
+        "Target",
+        "y"
+    ]
+
+    for col in candidate_names:
+        if col in df.columns:
+            return col
+
+    if fallback_to_last:
+        return df.columns[-1]
+
+    raise ValueError(
+        "Unable to resolve target column automatically. "
+        "Please specify it explicitly."
+    )
+
 
 class DOMEModel:
     """
-    DOME (Dynamic Optimization Meta-Ensemble) Model
+    DOME (Dynamic Optimization Meta-Ensemble) model for
+    inventory-based regional debris-flow susceptibility assessment.
 
-    An advanced meta-ensemble learning framework that combines multiple base learners
-    with dynamic optimization for debris flow risk assessment.
+    Notes
+    -----
+    - The code remains backward-compatible with legacy target naming such as
+      'Risk_index', but the current manuscript framing is susceptibility-oriented.
+    - SHAP interpretation is optional and requires the 'shap' package.
     """
 
-    def __init__(self, alpha=0.34, beta=0.04, gamma=0.01, random_state=42):
-        """
-        Initialize DOME model with hyperparameters
-
-        Parameters:
-        -----------
-        alpha : float, default=0.34
-            Weight parameter for ensemble combination
-        beta : float, default=0.04
-            Regularization parameter for learner selection
-        gamma : float, default=0.01
-            Convergence threshold for optimization
-        random_state : int, default=42
-            Random seed for reproducibility
-        """
+    def __init__(
+        self,
+        alpha=0.34,
+        beta=0.04,
+        gamma=0.01,
+        random_state=42,
+        cv_splits=5,
+        test_size=0.3,
+        n_candidate_base=5,
+        n_selected_base=3,
+        gcra_population_size=20,
+        gcra_max_iterations=20,
+        verbose=True
+    ):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
         self.random_state = random_state
+        self.cv_splits = cv_splits
+        self.test_size = test_size
+        self.n_candidate_base = n_candidate_base
+        self.n_selected_base = n_selected_base
+        self.gcra_population_size = gcra_population_size
+        self.gcra_max_iterations = gcra_max_iterations
+        self.verbose = verbose
 
-        # Initialize components
+        # Training-related artifacts
         self.scaler = StandardScaler()
+        self.original_feature_names = None
+        self.training_feature_fill_values_ = None
+
         self.selected_features = None
         self.feature_weights = None
+
+        self.candidate_base_learners_ = None
         self.selected_base_learners = None
         self.selected_meta_learner = None
+
+        self.optimized_selection_weights_ = None
+        self.learner_weights = None
+
         self.trained_base_learners = {}
         self.trained_meta_learner = None
-        self.learner_weights = None
+
+        self.last_metrics = None
+        self.last_results = None
+        self.optimization_fitness_ = None
+        self.shap_summary_ = None
+
         self.is_fitted = False
 
-        # Initialize base learner pool
+        # Initialize model pools
         self._initialize_base_learners()
         self._initialize_meta_learners()
 
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
+    def _log(self, message):
+        if self.verbose:
+            print(message)
+
+    def _adaptive_cv(self, n_samples, preferred_splits=None):
+        """
+        Create a safe KFold object for the current sample size.
+        Ensures at least 2 folds and at most n_samples folds.
+        """
+        preferred = preferred_splits if preferred_splits is not None else self.cv_splits
+        n_splits = max(2, min(int(preferred), int(n_samples)))
+        return KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
+
+    def _coerce_numeric_dataframe(self, X):
+        """Convert dataframe columns to numeric where possible."""
+        X = X.copy()
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors="coerce")
+        return X
+
+    def _sanitize_fill_values(self, fill_values):
+        cleaned = {}
+        for key, value in fill_values.items():
+            if pd.isna(value) or not np.isfinite(value):
+                cleaned[key] = 0.0
+            else:
+                cleaned[key] = float(value)
+        return cleaned
+
+    # ------------------------------------------------------------------
+    # Learner initialization
+    # ------------------------------------------------------------------
     def _initialize_base_learners(self):
-        """Initialize pool of base learners"""
+        """Initialize pool of base learners."""
         self.base_learners_pool = {
-            'RF': RandomForestRegressor(n_estimators=100, random_state=self.random_state),
-            'GradientBoosting': GradientBoostingRegressor(n_estimators=100, random_state=self.random_state),
-            'DecisionTree': DecisionTreeRegressor(random_state=self.random_state),
-            'SVR': SVR(kernel='rbf'),
-            'KNN': KNeighborsRegressor(n_neighbors=5),
-            'MLP': MLPRegressor(hidden_layer_sizes=(100,), max_iter=500, random_state=self.random_state),
-            'AdaBoost': AdaBoostRegressor(n_estimators=100, random_state=self.random_state),
-            'Bagging': BaggingRegressor(n_estimators=100, random_state=self.random_state)
+            "RF": RandomForestRegressor(
+                n_estimators=120,
+                random_state=self.random_state
+            ),
+            "GradientBoosting": GradientBoostingRegressor(
+                n_estimators=120,
+                random_state=self.random_state
+            ),
+            "DecisionTree": DecisionTreeRegressor(
+                random_state=self.random_state
+            ),
+            "SVR": SVR(kernel="rbf"),
+            "KNN": KNeighborsRegressor(n_neighbors=5),
+            "MLP": MLPRegressor(
+                hidden_layer_sizes=(80,),
+                max_iter=500,
+                random_state=self.random_state
+            ),
+            "AdaBoost": AdaBoostRegressor(
+                n_estimators=120,
+                random_state=self.random_state
+            ),
+            "Bagging": BaggingRegressor(
+                n_estimators=80,
+                random_state=self.random_state
+            ),
         }
 
-        # Add XGBoost if available
         if XGBOOST_AVAILABLE:
-            self.base_learners_pool['XGBoost'] = xgb.XGBRegressor(
-                n_estimators=100,
+            self.base_learners_pool["XGBoost"] = xgb.XGBRegressor(
+                n_estimators=120,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
                 random_state=self.random_state,
                 verbosity=0
             )
 
-        # Add LightGBM if available
         if LIGHTGBM_AVAILABLE:
-            self.base_learners_pool['LightGBM'] = lgb.LGBMRegressor(
-                n_estimators=100,
+            self.base_learners_pool["LightGBM"] = lgb.LGBMRegressor(
+                n_estimators=120,
+                learning_rate=0.05,
                 random_state=self.random_state,
                 verbosity=-1
             )
 
     def _initialize_meta_learners(self):
-        """Initialize pool of meta learners"""
+        """Initialize pool of meta learners."""
         self.meta_learners_pool = {
-            'LinearRegression': LinearRegression(),
-            'Ridge': Ridge(alpha=1.0),
-            'Lasso': Lasso(alpha=1.0),
-            'ElasticNet': ElasticNet(alpha=1.0),
-            'GradientBoosting': GradientBoostingRegressor(n_estimators=50, random_state=self.random_state),
-            'AdaBoost': AdaBoostRegressor(n_estimators=50, random_state=self.random_state),
-            'Bagging': BaggingRegressor(n_estimators=50, random_state=self.random_state),
-            'MLP': MLPRegressor(hidden_layer_sizes=(50,), max_iter=300, random_state=self.random_state)
+            "LinearRegression": LinearRegression(),
+            "Ridge": Ridge(alpha=1.0),
+            "Lasso": Lasso(alpha=0.01),
+            "ElasticNet": ElasticNet(alpha=0.01),
+            "GradientBoosting": GradientBoostingRegressor(
+                n_estimators=80,
+                random_state=self.random_state
+            ),
+            "AdaBoost": AdaBoostRegressor(
+                n_estimators=80,
+                random_state=self.random_state
+            ),
+            "Bagging": BaggingRegressor(
+                n_estimators=60,
+                random_state=self.random_state
+            ),
+            "MLP": MLPRegressor(
+                hidden_layer_sizes=(50,),
+                max_iter=400,
+                random_state=self.random_state
+            ),
         }
 
-        # Add XGBoost meta learner if available
         if XGBOOST_AVAILABLE:
-            self.meta_learners_pool['XGBoost'] = xgb.XGBRegressor(
-                n_estimators=50,
+            self.meta_learners_pool["XGBoost"] = xgb.XGBRegressor(
+                n_estimators=80,
+                max_depth=3,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
                 random_state=self.random_state,
                 verbosity=0
             )
 
+    # ------------------------------------------------------------------
+    # Workflow steps
+    # ------------------------------------------------------------------
     def step1_data_preprocessing(self, X, y):
-        """Step 1: Data collection and preprocessing"""
-        print("Step 1: Data collection and preprocessing")
-        print(f"Dataset shape: {X.shape}")
-        print(f"Processing {len(X)} debris flow samples")
+        """Step 1: Data preprocessing."""
+        self._log("Step 1: Data preprocessing")
+        self._log(f"  Raw feature shape: {X.shape}")
+        self._log(f"  Number of samples: {len(X)}")
 
-        # Handle missing values
-        if X.isnull().sum().sum() > 0:
-            print("  Handling missing values...")
-            X = X.fillna(X.mean())
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
 
-        if y.isnull().sum() > 0:
-            y = y.fillna(y.mean())
+        if isinstance(y, pd.DataFrame):
+            y = y.iloc[:, 0]
+        elif not isinstance(y, pd.Series):
+            y = pd.Series(y, name="target")
 
+        X = self._coerce_numeric_dataframe(X)
+        y = pd.to_numeric(y, errors="coerce")
+
+        # Replace inf with nan
+        X = X.replace([np.inf, -np.inf], np.nan)
+        y = y.replace([np.inf, -np.inf], np.nan)
+
+        # Fill missing values
+        feature_fill_values = X.median(numeric_only=True).to_dict()
+        feature_fill_values = self._sanitize_fill_values(feature_fill_values)
+
+        for col in X.columns:
+            fill_val = feature_fill_values.get(col, 0.0)
+            X[col] = X[col].fillna(fill_val)
+
+        y_fill = y.median()
+        if pd.isna(y_fill) or not np.isfinite(y_fill):
+            y_fill = 0.0
+        y = y.fillna(float(y_fill))
+
+        self.training_feature_fill_values_ = feature_fill_values
+
+        self._log("  Missing values handled successfully.")
         return X, y
 
-    def step2_train_test_split(self, X, y, test_size=0.3):
-        """Step 2: Training and testing set partitioning"""
-        print("Step 2: Training and testing set partitioning")
+    def step2_train_test_split(self, X, y):
+        """Step 2: Train-test split."""
+        self._log("Step 2: Training/testing partitioning")
 
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=self.random_state, stratify=None
+            X,
+            y,
+            test_size=self.test_size,
+            random_state=self.random_state
         )
 
-        print(f"Training set: {len(X_train)} samples")
-        print(f"Testing set: {len(X_test)} samples")
-
+        self._log(f"  Training samples: {len(X_train)}")
+        self._log(f"  Testing samples: {len(X_test)}")
         return X_train, X_test, y_train, y_test
 
     def step3_feature_analysis_selection(self, X_train, y_train):
-        """Step 3: Feature analysis and selection using RFE and VIF"""
-        print("Step 3: Feature analysis and selection")
+        """
+        Step 3: Feature analysis and selection using
+        RFE + multicollinearity screening + pragmatic ICWCM-style weighting.
+        """
+        self._log("Step 3: Feature analysis and selection")
 
-        # Recursive Feature Elimination (RFE)
-        print("  Performing Recursive Feature Elimination (RFE)...")
-        rfe_estimator = RandomForestRegressor(n_estimators=50, random_state=self.random_state)
-        n_features_to_select = min(max(int(X_train.shape[1] * 0.7), 5), X_train.shape[1])
-        rfe = RFE(estimator=rfe_estimator, n_features_to_select=n_features_to_select)
+        if X_train.shape[1] <= 3:
+            final_features = list(X_train.columns)
+            feature_weights = self._calculate_icwcm_weights(X_train[final_features], y_train)
+            self._log(f"  Feature count small; using all features: {final_features}")
+            return X_train[final_features], final_features, feature_weights
+
+        n_features_to_select = min(
+            max(int(np.ceil(X_train.shape[1] * 0.7)), 5),
+            X_train.shape[1]
+        )
+
+        self._log("  Running Recursive Feature Elimination (RFE)...")
+        rfe_estimator = RandomForestRegressor(
+            n_estimators=60,
+            random_state=self.random_state
+        )
+        rfe = RFE(
+            estimator=rfe_estimator,
+            n_features_to_select=n_features_to_select
+        )
         rfe.fit(X_train, y_train)
-
         rfe_selected_features = X_train.columns[rfe.support_].tolist()
-        print(f"  RFE selected {len(rfe_selected_features)} features")
+        self._log(f"  RFE retained {len(rfe_selected_features)} features.")
 
-        # Multicollinearity detection using VIF
-        print("  Calculating correlation matrix for multicollinearity detection...")
-        X_rfe = X_train[rfe_selected_features]
-
-        # Calculate VIF for selected features
+        # Multicollinearity screening
+        X_rfe = X_train[rfe_selected_features].copy()
         high_vif_features = []
+
         try:
-            for i, feature in enumerate(X_rfe.columns):
-                vif = variance_inflation_factor(X_rfe.values, i)
-                if vif > 10:  # VIF threshold
-                    high_vif_features.append(feature)
-        except:
-            # If VIF calculation fails, use correlation-based removal
+            if X_rfe.shape[1] >= 2:
+                for i, feature in enumerate(X_rfe.columns):
+                    vif = variance_inflation_factor(X_rfe.values, i)
+                    if np.isfinite(vif) and vif > 10:
+                        high_vif_features.append(feature)
+        except Exception:
             corr_matrix = X_rfe.corr().abs()
             upper_tri = corr_matrix.where(
                 np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
             )
-            high_corr_features = [column for column in upper_tri.columns if any(upper_tri[column] > 0.9)]
-            high_vif_features = high_corr_features
+            high_vif_features = [
+                column for column in upper_tri.columns
+                if any(upper_tri[column] > 0.90)
+            ]
 
         if high_vif_features:
-            print(f"  Removing high VIF features: {high_vif_features}")
-            final_features = [f for f in rfe_selected_features if f not in high_vif_features]
+            tentative_features = [
+                f for f in rfe_selected_features
+                if f not in high_vif_features
+            ]
+            if len(tentative_features) >= 3:
+                final_features = tentative_features
+                self._log(f"  Removed high-VIF/high-correlation features: {high_vif_features}")
+            else:
+                final_features = rfe_selected_features
+                self._log("  High-VIF removal would leave too few features; retaining RFE set.")
         else:
             final_features = rfe_selected_features
-
-        print(f"  Final selected features ({len(final_features)}): {final_features}")
-
-        # Information-Correlation Weighted Combination Method (ICWCM)
-        print("  Applying Information-Correlation Weighted Combination Method (ICWCM)...")
-        print("  Calculating feature weights using ICWCM...")
 
         X_selected = X_train[final_features]
         feature_weights = self._calculate_icwcm_weights(X_selected, y_train)
 
+        self._log(f"  Final selected features ({len(final_features)}): {final_features}")
         return X_selected, final_features, feature_weights
 
     def _calculate_icwcm_weights(self, X_selected, y_train):
-        """Calculate feature weights using Information-Correlation Weighted Combination Method"""
-        n_features = X_selected.shape[1]
-        weights = np.ones(n_features) / n_features
+        """
+        Pragmatic ICWCM-style feature weighting.
 
-        # Simple correlation-based weighting
-        correlations = []
+        This implementation combines:
+        - information proxy: feature dispersion (standard deviation)
+        - correlation proxy: absolute Spearman correlation with target
+        """
+        X_selected = X_selected.copy()
+
+        info_scores = X_selected.std(axis=0, ddof=0).values.astype(float)
+        if np.allclose(info_scores.sum(), 0):
+            info_scores = np.ones(len(info_scores), dtype=float)
+        info_scores = info_scores / info_scores.sum()
+
+        corr_scores = []
         for feature in X_selected.columns:
-            try:
-                corr, _ = spearmanr(X_selected[feature], y_train)
-                correlations.append(abs(corr) if not np.isnan(corr) else 0)
-            except:
-                correlations.append(0)
+            corr = safe_spearman_correlation(X_selected[feature].values, y_train.values)
+            corr_scores.append(abs(corr))
+        corr_scores = np.asarray(corr_scores, dtype=float)
 
-        if sum(correlations) > 0:
-            weights = np.array(correlations) / sum(correlations)
+        if np.allclose(corr_scores.sum(), 0):
+            corr_scores = np.ones(len(corr_scores), dtype=float)
+        corr_scores = corr_scores / corr_scores.sum()
 
+        weights = 0.5 * info_scores + 0.5 * corr_scores
+        weights = weights / weights.sum()
         return weights
 
-    def step4_initial_learner_selection(self, X_train, y_train):
-        """Step 4: Initial learner selection and cross-validation"""
-        print("Step 4: Initial learner selection and cross-validation")
-        print("  Evaluating base learners with 5-fold cross-validation...")
+    def _build_oof_matrix(self, X, y, learner_names, cv=None):
+        """
+        Build out-of-fold prediction matrix for selected learners.
+        """
+        X = X.copy()
+        y = y.copy()
+        cv = cv if cv is not None else self._adaptive_cv(len(X), self.cv_splits)
 
+        oof_columns = []
+        for learner_name in learner_names:
+            estimator = clone(self.base_learners_pool[learner_name])
+            try:
+                preds = cross_val_predict(
+                    estimator,
+                    X,
+                    y,
+                    cv=cv,
+                    method="predict",
+                    n_jobs=None
+                )
+            except Exception:
+                # Fallback to in-sample predictions if OOF fails
+                estimator.fit(X, y)
+                preds = estimator.predict(X)
+            oof_columns.append(np.asarray(preds, dtype=float))
+
+        return np.column_stack(oof_columns)
+
+    def step4_initial_learner_selection(self, X_train, y_train):
+        """
+        Step 4: Initial learner screening via CV for base learners and OOF meta-features.
+        """
+        self._log("Step 4: Initial learner screening")
+
+        cv = self._adaptive_cv(len(X_train), self.cv_splits)
         base_learner_scores = {}
 
+        self._log("  Evaluating base learners with cross-validation...")
         for name, learner in self.base_learners_pool.items():
             try:
-                scores = cross_val_score(learner, X_train, y_train, cv=5,
-                                         scoring='neg_mean_squared_error', n_jobs=-1)
-                rmse_scores = np.sqrt(-scores)
-                avg_rmse = np.mean(rmse_scores)
-                base_learner_scores[name] = avg_rmse
-                print(f"    {name}: CV RMSE = {avg_rmse:.6f}")
+                scores = cross_val_score(
+                    clone(learner),
+                    X_train,
+                    y_train,
+                    cv=cv,
+                    scoring="neg_mean_squared_error",
+                    n_jobs=None
+                )
+                rmse = float(np.mean(np.sqrt(-scores)))
+                base_learner_scores[name] = rmse
+                self._log(f"    {name}: CV RMSE = {rmse:.6f}")
             except Exception as e:
-                print(f"    {name}: Failed - {str(e)}")
-                base_learner_scores[name] = float('inf')
+                base_learner_scores[name] = float("inf")
+                self._log(f"    {name}: Failed ({e})")
 
-        # Select top 3 base learners
-        sorted_learners = sorted(base_learner_scores.items(), key=lambda x: x[1])
-        top_base_learners = [name for name, _ in sorted_learners[:3]]
-        print(f"  Selected top base learners: {top_base_learners}")
+        candidate_count = min(self.n_candidate_base, len(base_learner_scores))
+        sorted_base = sorted(base_learner_scores.items(), key=lambda x: x[1])
+        candidate_base_learners = [name for name, _ in sorted_base[:candidate_count]]
+        self.candidate_base_learners_ = candidate_base_learners
+        self._log(f"  Candidate base learners: {candidate_base_learners}")
 
-        # Evaluate meta learners
-        print("  Evaluating meta learners...")
-        meta_learner_scores = {}
-
-        # Create dummy meta features for evaluation
-        dummy_meta_features = np.random.random((len(X_train), 3))
-
-        for name, learner in self.meta_learners_pool.items():
-            try:
-                scores = cross_val_score(learner, dummy_meta_features, y_train, cv=5,
-                                         scoring='neg_mean_squared_error', n_jobs=-1)
-                rmse_scores = np.sqrt(-scores)
-                avg_rmse = np.mean(rmse_scores)
-                meta_learner_scores[name] = avg_rmse
-                print(f"    {name}: CV RMSE = {avg_rmse:.6f}")
-            except Exception as e:
-                print(f"    {name}: Failed - {str(e)}")
-                meta_learner_scores[name] = float('inf')
-
-        # Select best meta learner
-        best_meta_learner = min(meta_learner_scores.items(), key=lambda x: x[1])[0]
-        print(f"  Selected meta learner: {best_meta_learner}")
-
-        return top_base_learners, best_meta_learner
-
-    def step5_dynamic_learner_selection_optimization(self, X_train, y_train,
-                                                     candidate_base_learners, candidate_meta_learner):
-        """Step 5: Dynamic learner selection and optimization using GCRA"""
-        from gcra_optimizer import GCRA
-
-        def objective_function(individual):
-            """Objective function for GCRA optimization"""
-            return self._evaluate_learner_combination(
-                individual, X_train, y_train, candidate_base_learners, candidate_meta_learner
-            )
-
-        print("  Running GCRA optimization...")
-
-        # Initialize GCRA optimizer
-        gcra = GCRA(
-            objective_function=objective_function,
-            population_size=30,
-            max_iterations=50,
-            dimensions=len(candidate_base_learners) + 3,  # learner selection + weights
-            bounds=[(0, 1)] * len(candidate_base_learners) + [(0.1, 1)] * 3
+        self._log("  Building OOF meta-features for meta-learner screening...")
+        oof_meta_features = self._build_oof_matrix(
+            X_train,
+            y_train,
+            candidate_base_learners,
+            cv=cv
         )
 
-        # Run optimization
-        best_solution, best_fitness = gcra.optimize()
+        meta_learner_scores = {}
+        self._log("  Evaluating meta learners...")
+        for name, learner in self.meta_learners_pool.items():
+            try:
+                scores = cross_val_score(
+                    clone(learner),
+                    oof_meta_features,
+                    y_train,
+                    cv=cv,
+                    scoring="neg_mean_squared_error",
+                    n_jobs=None
+                )
+                rmse = float(np.mean(np.sqrt(-scores)))
+                meta_learner_scores[name] = rmse
+                self._log(f"    {name}: CV RMSE = {rmse:.6f}")
+            except Exception as e:
+                meta_learner_scores[name] = float("inf")
+                self._log(f"    {name}: Failed ({e})")
 
-        if best_fitness == float('inf'):
-            print("  GCRA optimization failed, using default selection...")
-            # Fallback to default selection
-            self.selected_base_learners = candidate_base_learners[:3]
+        best_meta_learner = min(meta_learner_scores.items(), key=lambda x: x[1])[0]
+        self._log(f"  Selected candidate meta learner: {best_meta_learner}")
+
+        return candidate_base_learners, best_meta_learner
+
+    def _decode_solution(self, solution, candidate_base_learners):
+        """
+        Decode GCRA solution into selected learners and normalized weights.
+        The solution format is:
+          [selection_scores..., raw_weight_scores...]
+        """
+        n_candidates = len(candidate_base_learners)
+        if solution is None or len(solution) != 2 * n_candidates:
+            selected = candidate_base_learners[:min(self.n_selected_base, n_candidates)]
+            weights = np.ones(len(selected), dtype=float)
+            weights = weights / weights.sum()
+            return selected, weights
+
+        selection_scores = np.asarray(solution[:n_candidates], dtype=float)
+        raw_weights = np.asarray(solution[n_candidates:], dtype=float)
+
+        selected_count = min(self.n_selected_base, n_candidates)
+        selected_indices = np.argsort(selection_scores)[-selected_count:]
+        selected_indices = selected_indices[np.argsort(selection_scores[selected_indices])[::-1]]
+
+        selected_learners = [candidate_base_learners[i] for i in selected_indices]
+        selected_weights = raw_weights[selected_indices]
+
+        if np.allclose(selected_weights.sum(), 0):
+            selected_weights = np.ones(len(selected_learners), dtype=float)
+
+        selected_weights = selected_weights / selected_weights.sum()
+        return selected_learners, selected_weights
+
+    def _evaluate_learner_combination(
+        self,
+        individual,
+        X_train,
+        y_train,
+        candidate_base_learners,
+        candidate_meta_learner
+    ):
+        """
+        Objective function for GCRA optimization.
+
+        Fitness = mean CV RMSE
+                  + alpha * stability penalty
+                  + beta  * complexity penalty
+                  + gamma * redundancy penalty
+        """
+        try:
+            selected_learners, selected_weights = self._decode_solution(
+                individual,
+                candidate_base_learners
+            )
+
+            if len(selected_learners) == 0:
+                return float("inf")
+
+            outer_cv = self._adaptive_cv(
+                len(X_train),
+                preferred_splits=min(3, self.cv_splits)
+            )
+
+            fold_rmses = []
+            fold_redundancy = []
+
+            for train_idx, valid_idx in outer_cv.split(X_train):
+                X_tr = X_train.iloc[train_idx]
+                X_val = X_train.iloc[valid_idx]
+                y_tr = y_train.iloc[train_idx]
+                y_val = y_train.iloc[valid_idx]
+
+                inner_cv = self._adaptive_cv(
+                    len(X_tr),
+                    preferred_splits=min(3, self.cv_splits)
+                )
+
+                # OOF predictions on training fold for meta-learner fitting
+                oof_matrix = self._build_oof_matrix(
+                    X_tr,
+                    y_tr,
+                    selected_learners,
+                    cv=inner_cv
+                )
+                weighted_oof = oof_matrix * selected_weights
+
+                meta_learner = clone(self.meta_learners_pool[candidate_meta_learner])
+                meta_learner.fit(weighted_oof, y_tr)
+
+                # Fit base learners on full training fold and predict validation fold
+                val_columns = []
+                for learner_name, weight in zip(selected_learners, selected_weights):
+                    base_model = clone(self.base_learners_pool[learner_name])
+                    base_model.fit(X_tr, y_tr)
+                    val_pred = np.asarray(base_model.predict(X_val), dtype=float) * weight
+                    val_columns.append(val_pred)
+
+                val_matrix = np.column_stack(val_columns)
+                val_pred_final = meta_learner.predict(val_matrix)
+
+                rmse = np.sqrt(mean_squared_error(y_val, val_pred_final))
+                fold_rmses.append(float(rmse))
+
+                if val_matrix.shape[1] > 1:
+                    corr = np.corrcoef(val_matrix.T)
+                    upper = corr[np.triu_indices_from(corr, k=1)]
+                    upper = upper[np.isfinite(upper)]
+                    redundancy = float(np.mean(np.abs(upper))) if upper.size > 0 else 0.0
+                else:
+                    redundancy = 0.0
+                fold_redundancy.append(redundancy)
+
+            mean_rmse = float(np.mean(fold_rmses))
+            stability_penalty = float(np.std(fold_rmses))
+            complexity_penalty = float(len(selected_learners) / max(len(candidate_base_learners), 1))
+            redundancy_penalty = float(np.mean(fold_redundancy))
+
+            fitness = (
+                mean_rmse
+                + self.alpha * stability_penalty
+                + self.beta * complexity_penalty
+                + self.gamma * redundancy_penalty
+            )
+            return float(fitness)
+
+        except Exception:
+            return float("inf")
+
+    def step5_dynamic_learner_selection_optimization(
+        self,
+        X_train,
+        y_train,
+        candidate_base_learners,
+        candidate_meta_learner
+    ):
+        """
+        Step 5: Dynamic learner selection and optimization using GCRA.
+        Falls back gracefully if GCRA is unavailable.
+        """
+        self._log("Step 5: Dynamic learner optimization")
+
+        try:
+            from gcra_optimizer import GCRA
+            gcra_available = True
+        except Exception:
+            gcra_available = False
+
+        if not gcra_available:
+            self._log("  GCRA unavailable; using fallback learner selection.")
+            self.selected_base_learners = candidate_base_learners[:min(self.n_selected_base, len(candidate_base_learners))]
             self.selected_meta_learner = candidate_meta_learner
-            self.learner_weights = np.array([1 / 3, 1 / 3, 1 / 3])
-        else:
-            # Parse optimization results
-            learner_selection = best_solution[:len(candidate_base_learners)]
-            weights = best_solution[len(candidate_base_learners):]
+            self.optimized_selection_weights_ = np.ones(len(self.selected_base_learners), dtype=float)
+            self.optimized_selection_weights_ /= self.optimized_selection_weights_.sum()
+            self.optimization_fitness_ = None
+            return None, None
 
-            # Select top 3 learners based on optimization
-            selected_indices = np.argsort(learner_selection)[-3:]
-            self.selected_base_learners = [candidate_base_learners[i] for i in selected_indices]
+        def objective_function(individual):
+            return self._evaluate_learner_combination(
+                individual,
+                X_train,
+                y_train,
+                candidate_base_learners,
+                candidate_meta_learner
+            )
+
+        n_candidates = len(candidate_base_learners)
+        dimensions = 2 * n_candidates
+        bounds = [(0.0, 1.0)] * dimensions
+
+        self._log(
+            f"  Running GCRA "
+            f"(population={self.gcra_population_size}, iterations={self.gcra_max_iterations})..."
+        )
+
+        try:
+            gcra = GCRA(
+                objective_function=objective_function,
+                population_size=self.gcra_population_size,
+                max_iterations=self.gcra_max_iterations,
+                dimensions=dimensions,
+                bounds=bounds
+            )
+            best_solution, best_fitness = gcra.optimize()
+        except Exception as e:
+            self._log(f"  GCRA failed ({e}); using fallback learner selection.")
+            self.selected_base_learners = candidate_base_learners[:min(self.n_selected_base, len(candidate_base_learners))]
             self.selected_meta_learner = candidate_meta_learner
-            self.learner_weights = weights / np.sum(weights)  # Normalize weights
+            self.optimized_selection_weights_ = np.ones(len(self.selected_base_learners), dtype=float)
+            self.optimized_selection_weights_ /= self.optimized_selection_weights_.sum()
+            self.optimization_fitness_ = None
+            return None, None
 
-        print(f"  Optimization completed. Best fitness: {best_fitness:.6f}")
+        selected_learners, selected_weights = self._decode_solution(
+            best_solution,
+            candidate_base_learners
+        )
+
+        self.selected_base_learners = selected_learners
+        self.selected_meta_learner = candidate_meta_learner
+        self.optimized_selection_weights_ = selected_weights
+        self.optimization_fitness_ = best_fitness
+
+        self._log(f"  Optimized base learners: {self.selected_base_learners}")
+        self._log(f"  Optimized prior weights: {np.round(self.optimized_selection_weights_, 4)}")
+        self._log(f"  Best fitness: {best_fitness:.6f}")
 
         return best_solution, best_fitness
 
-    def _evaluate_learner_combination(self, individual, X_train, y_train,
-                                      candidate_base_learners, candidate_meta_learner):
-        """Evaluate a specific learner combination"""
-        try:
-            # Parse individual
-            learner_selection = individual[:len(candidate_base_learners)]
-            weights = individual[len(candidate_base_learners):]
-
-            # Select top 3 learners
-            selected_indices = np.argsort(learner_selection)[-3:]
-            selected_learners = [candidate_base_learners[i] for i in selected_indices]
-
-            # Train base learners
-            base_predictions = []
-            for learner_name in selected_learners:
-                learner = self.base_learners_pool[learner_name]
-                learner.fit(X_train, y_train)
-                pred = learner.predict(X_train)
-                base_predictions.append(pred)
-
-            # Train meta learner
-            meta_features = np.column_stack(base_predictions)
-            meta_learner = self.meta_learners_pool[candidate_meta_learner]
-            meta_learner.fit(meta_features, y_train)
-
-            # Evaluate performance
-            final_pred = meta_learner.predict(meta_features)
-            rmse = np.sqrt(mean_squared_error(y_train, final_pred))
-
-            return rmse
-
-        except Exception as e:
-            return float('inf')  # Return high error for failed combinations
-
     def step6_model_training_optimization(self, X_train, y_train):
-        """Step 6: Model training and optimization"""
-        print("Step 6: Model training and optimization")
-        print("  Training base learners...")
+        """
+        Step 6: Train final base learners and meta learner using OOF stacking.
+        """
+        self._log("Step 6: Final stacked model training")
 
-        # Train selected base learners
+        if self.selected_base_learners is None or len(self.selected_base_learners) == 0:
+            raise ValueError("No base learners selected before final training.")
+
+        cv = self._adaptive_cv(len(X_train), self.cv_splits)
+
+        # Build OOF meta-features for final meta-learner training
+        oof_matrix = self._build_oof_matrix(
+            X_train,
+            y_train,
+            self.selected_base_learners,
+            cv=cv
+        )
+
+        # Performance-derived learner weights
+        performance_weights = []
+        for i in range(oof_matrix.shape[1]):
+            rmse_i = np.sqrt(mean_squared_error(y_train, oof_matrix[:, i]))
+            performance_weights.append(1.0 / (rmse_i + 1e-8))
+        performance_weights = np.asarray(performance_weights, dtype=float)
+        performance_weights = performance_weights / performance_weights.sum()
+
+        # Combine optimization priors with performance-derived weights
+        if (
+            self.optimized_selection_weights_ is not None
+            and len(self.optimized_selection_weights_) == len(performance_weights)
+        ):
+            combined_weights = (
+                self.alpha * self.optimized_selection_weights_
+                + (1.0 - self.alpha) * performance_weights
+            )
+        else:
+            combined_weights = performance_weights
+
+        combined_weights = combined_weights / combined_weights.sum()
+        self.learner_weights = combined_weights
+
+        self._log(f"  Final learner weights: {np.round(self.learner_weights, 4)}")
+
+        weighted_oof = oof_matrix * self.learner_weights
+        meta_model = clone(self.meta_learners_pool[self.selected_meta_learner])
+        meta_model.fit(weighted_oof, y_train)
+        self.trained_meta_learner = meta_model
+
+        # Train final base learners on the full training data
+        self.trained_base_learners = {}
         for learner_name in self.selected_base_learners:
-            print(f"    Training {learner_name}...")
-            learner = self.base_learners_pool[learner_name]
-            learner.fit(X_train, y_train)
-            self.trained_base_learners[learner_name] = learner
+            self._log(f"  Training final base learner: {learner_name}")
+            model = clone(self.base_learners_pool[learner_name])
+            model.fit(X_train, y_train)
+            self.trained_base_learners[learner_name] = model
 
-        # Calculate refined learner weights using Equation (2)
-        print("  Calculating learner weights using Eq. (2)...")
-        base_predictions = []
-        for learner_name in self.selected_base_learners:
-            learner = self.trained_base_learners[learner_name]
-            pred = learner.predict(X_train)
-            base_predictions.append(pred)
-
-        # Calculate weights based on individual performance
-        weights = []
-        for i, pred in enumerate(base_predictions):
-            mse = mean_squared_error(y_train, pred)
-            weight = 1.0 / (mse + 1e-10)  # Add small epsilon to avoid division by zero
-            weights.append(weight)
-
-        # Normalize weights
-        self.learner_weights = np.array(weights) / np.sum(weights)
-        print(f"  Refined learner weights: {self.learner_weights}")
-
-        # Train meta learner with weighted stacking
-        print("  Training meta learner with weighted stacking...")
-        meta_features = np.column_stack(base_predictions)
-        meta_learner = self.meta_learners_pool[self.selected_meta_learner]
-        meta_learner.fit(meta_features, y_train)
-        self.trained_meta_learner = meta_learner
-
-        print("  Model training completed successfully!")
+        self._log("  Final stacked model trained successfully.")
 
     def step7_model_validation(self, X_test, y_test):
-        """Step 7: Model validation and result analysis"""
-        print("Step 7: Model validation and result analysis")
+        """Step 7: Model validation."""
+        self._log("Step 7: Model validation")
 
-        # Make predictions
         y_pred = self._predict_internal(X_test)
 
-        # Calculate performance metrics
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        mae = mean_absolute_error(y_test, y_pred)
-        mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
-
-        # Calculate Spearman correlation
-        try:
-            spearman_corr, _ = spearmanr(y_test, y_pred)
-        except:
-            spearman_corr = 0.0
+        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+        mae = float(mean_absolute_error(y_test, y_pred))
+        mape = safe_mape(y_test, y_pred)
+        spearman_corr = safe_spearman_correlation(y_test, y_pred)
 
         metrics = {
-            'RMSE': rmse,
-            'MAE': mae,
-            'MAPE': mape,
-            'Spearman_Correlation': spearman_corr
+            "RMSE": rmse,
+            "MAE": mae,
+            "MAPE": mape,
+            "Spearman_Correlation": spearman_corr
         }
 
-        print(f"  RMSE: {rmse:.6f}")
-        print(f"  MAE: {mae:.6f}")
-        print(f"  MAPE: {mape:.2f}%")
-        print(f"  Spearman Correlation: {spearman_corr:.6f}")
+        self._log(f"  RMSE: {rmse:.6f}")
+        self._log(f"  MAE: {mae:.6f}")
+        self._log(f"  MAPE: {mape:.2f}%")
+        self._log(f"  Spearman Correlation: {spearman_corr:.6f}")
 
+        self.last_metrics = metrics
         return metrics
 
     def step8_optimization_analysis(self):
-        """Step 8: Optimization process analysis and result interpretation"""
-        print("Step 8: Optimization process analysis and result interpretation")
-        print("  Model optimization completed successfully!")
-        print(f"  Selected base learners: {self.selected_base_learners}")
-        print(f"  Selected meta learner: {self.selected_meta_learner}")
-        print(f"  Optimized learner weights: {self.learner_weights}")
+        """Step 8: Training summary."""
+        self._log("Step 8: Optimization and training summary")
+        self._log(f"  Selected base learners: {self.selected_base_learners}")
+        self._log(f"  Selected meta learner: {self.selected_meta_learner}")
+        if self.learner_weights is not None:
+            self._log(f"  Final learner weights: {np.round(self.learner_weights, 4)}")
+        if self.optimization_fitness_ is not None:
+            self._log(f"  Optimization fitness: {self.optimization_fitness_:.6f}")
 
+    # ------------------------------------------------------------------
+    # Feature preparation and prediction
+    # ------------------------------------------------------------------
+    def _prepare_features(self, X):
+        """
+        Prepare raw feature dataframe for prediction.
+
+        Rules:
+        - Extra columns are ignored
+        - Missing non-selected training columns are filled with training medians
+        - Missing selected columns raise an error
+        """
+        if self.original_feature_names is None:
+            raise ValueError("Model has no stored feature schema. Fit the model first.")
+
+        if isinstance(X, np.ndarray):
+            if X.ndim != 2 or X.shape[1] != len(self.original_feature_names):
+                raise ValueError(
+                    "When passing a NumPy array to predict(), it must have the same "
+                    "number of columns as the original training data."
+                )
+            X = pd.DataFrame(X, columns=self.original_feature_names)
+
+        if not isinstance(X, pd.DataFrame):
+            raise ValueError("Input features must be a pandas DataFrame or compatible 2D NumPy array.")
+
+        X = X.copy()
+
+        # Ensure required selected features exist
+        for feature in self.selected_features:
+            if feature not in X.columns:
+                raise ValueError(f"Missing required selected feature: {feature}")
+
+        # Add missing non-selected original columns
+        for col in self.original_feature_names:
+            if col not in X.columns:
+                fill_val = self.training_feature_fill_values_.get(col, 0.0)
+                X[col] = fill_val
+
+        # Keep only original training columns in original order
+        X = X[self.original_feature_names]
+        X = self._coerce_numeric_dataframe(X)
+
+        for col in X.columns:
+            fill_val = self.training_feature_fill_values_.get(col, 0.0)
+            X[col] = X[col].fillna(fill_val)
+
+        return X
+
+    def transform_selected_features(self, X):
+        """
+        Public helper: transform raw input into scaled selected-feature space.
+        """
+        X_prepared = self._prepare_features(X)
+        X_scaled = pd.DataFrame(
+            self.scaler.transform(X_prepared),
+            columns=self.original_feature_names,
+            index=X_prepared.index
+        )
+        return X_scaled[self.selected_features]
+
+    def _predict_from_selected_scaled(self, X_selected_scaled):
+        """Predict from already scaled selected-feature space."""
+        if isinstance(X_selected_scaled, np.ndarray):
+            X_selected_scaled = pd.DataFrame(
+                X_selected_scaled,
+                columns=self.selected_features
+            )
+
+        base_predictions = []
+        for learner_name, weight in zip(self.selected_base_learners, self.learner_weights):
+            learner = self.trained_base_learners[learner_name]
+            pred = np.asarray(learner.predict(X_selected_scaled), dtype=float) * weight
+            base_predictions.append(pred)
+
+        meta_features = np.column_stack(base_predictions)
+        final_pred = self.trained_meta_learner.predict(meta_features)
+        return np.asarray(final_pred, dtype=float)
+
+    def _predict_internal(self, X):
+        """Internal prediction without fitted-state check."""
+        X_selected_scaled = self.transform_selected_features(X)
+        return self._predict_from_selected_scaled(X_selected_scaled)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def fit(self, X, y):
         """
-        Fit the DOME model using the 8-step workflow
+        Fit the DOME model.
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         X : pandas.DataFrame
-            Input features
-        y : pandas.Series
-            Target variable
+            Conditioning factors / explanatory variables.
+        y : pandas.Series or array-like
+            Susceptibility target (legacy 'Risk_index' also supported).
 
-        Returns:
-        --------
-        dict : Training results and metrics
+        Returns
+        -------
+        dict
+            Training and validation summary.
         """
-        print("=" * 80)
-        print("DOME Model Training - 8-Step Workflow")
-        print(f"Processing {len(X)} debris flow samples")
-        print("=" * 80)
+        self._log("=" * 80)
+        self._log("DOME Training Workflow")
+        self._log("Inventory-Based Regional Debris-Flow Susceptibility Assessment")
+        self._log("=" * 80)
 
-        # Step 1: Data preprocessing
+        # Step 1
         X, y = self.step1_data_preprocessing(X, y)
 
-        # Step 2: Train-test split
+        self.original_feature_names = list(X.columns)
+        if self.training_feature_fill_values_ is None:
+            fills = X.median(numeric_only=True).to_dict()
+            self.training_feature_fill_values_ = self._sanitize_fill_values(fills)
+
+        # Step 2
         X_train, X_test, y_train, y_test = self.step2_train_test_split(X, y)
 
-        # Feature scaling - Scale ALL features first
+        # Scale full feature space
         X_train_scaled = pd.DataFrame(
-            self.scaler.fit_transform(X_train),  # ✅ Train scaler on ALL features
+            self.scaler.fit_transform(X_train),
             columns=X_train.columns,
             index=X_train.index
         )
         X_test_scaled = pd.DataFrame(
-            self.scaler.transform(X_test),  # ✅ Transform ALL features
+            self.scaler.transform(X_test),
             columns=X_test.columns,
             index=X_test.index
         )
 
-        # Step 3: Feature analysis and selection
+        # Step 3
         X_train_selected, selected_features, feature_weights = self.step3_feature_analysis_selection(
-            X_train_scaled, y_train  # ✅ Feature selection on scaled data
+            X_train_scaled,
+            y_train
         )
-        X_test_selected = X_test_scaled[selected_features]  # Select same features for test set
+        X_test_selected = X_test_scaled[selected_features]
 
-        # Store feature information
         self.selected_features = selected_features
         self.feature_weights = feature_weights
 
-        # Step 4: Initial learner selection
+        # Step 4
         candidate_base_learners, candidate_meta_learner = self.step4_initial_learner_selection(
-            X_train_selected, y_train
+            X_train_selected,
+            y_train
         )
 
-        # Step 5: Dynamic optimization using GCRA
-        try:
-            best_solution, best_fitness = self.step5_dynamic_learner_selection_optimization(
-                X_train_selected, y_train, candidate_base_learners, candidate_meta_learner
-            )
-        except Exception as e:
-            print(f"  GCRA optimization failed: {e}")
-            print("  Using fallback selection...")
-            self.selected_base_learners = candidate_base_learners[:3]
-            self.selected_meta_learner = candidate_meta_learner
-            self.learner_weights = np.array([1 / 3, 1 / 3, 1 / 3])
+        # Step 5
+        self.step5_dynamic_learner_selection_optimization(
+            X_train_selected,
+            y_train,
+            candidate_base_learners,
+            candidate_meta_learner
+        )
 
-        # Step 6: Model training and optimization
+        # Step 6
         self.step6_model_training_optimization(X_train_selected, y_train)
 
-        # Step 7: Model validation - ✅ Pass ALL features (scaled)
-        validation_metrics = self.step7_model_validation(X_test_scaled, y_test)
-
-        # Step 8: Optimization analysis
-        self.step8_optimization_analysis()
-
-        # Mark model as fitted
+        # Mark fitted before external-style validation helpers if needed
         self.is_fitted = True
 
-        # Return comprehensive results
+        # Step 7
+        validation_metrics = self.step7_model_validation(X_test, y_test)
+
+        # Step 8
+        self.step8_optimization_analysis()
+
         results = {
-            'selected_base_learners': self.selected_base_learners,
-            'selected_meta_learner': self.selected_meta_learner,
-            'learner_weights': self.learner_weights,
-            'selected_features': self.selected_features,
-            'feature_weights': self.feature_weights,
-            'performance_metrics': validation_metrics,
-            'training_samples': len(X_train),
-            'testing_samples': len(X_test),
-            'total_features': len(X.columns),
-            'selected_feature_count': len(self.selected_features)
+            "selected_base_learners": self.selected_base_learners,
+            "selected_meta_learner": self.selected_meta_learner,
+            "candidate_base_learners": candidate_base_learners,
+            "optimized_prior_weights": (
+                self.optimized_selection_weights_.tolist()
+                if self.optimized_selection_weights_ is not None
+                else None
+            ),
+            "learner_weights": (
+                self.learner_weights.tolist()
+                if self.learner_weights is not None
+                else None
+            ),
+            "selected_features": self.selected_features,
+            "feature_weights": self.feature_weights.tolist() if self.feature_weights is not None else None,
+            "performance_metrics": validation_metrics,
+            "training_samples": int(len(X_train)),
+            "testing_samples": int(len(X_test)),
+            "total_features": int(len(X.columns)),
+            "selected_feature_count": int(len(self.selected_features)),
+            "optimization_fitness": (
+                float(self.optimization_fitness_)
+                if self.optimization_fitness_ is not None
+                else None
+            )
         }
 
-        print("\n" + "=" * 80)
-        print("DOME Model Training Completed Successfully!")
-        print("=" * 80)
+        self.last_results = results
+
+        self._log("=" * 80)
+        self._log("DOME training completed successfully.")
+        self._log("=" * 80)
 
         return results
 
-    def _predict_internal(self, X):
-        """Internal prediction method without fitted check"""
-        # Scale ALL features (scaler was trained on all features)
-        X_scaled = pd.DataFrame(
-            self.scaler.transform(X),  # ✅ Scale all features
-            columns=X.columns,
-            index=X.index
-        )
-
-        # Select features after scaling
-        X_selected = X_scaled[self.selected_features]  # ✅ Then select needed features
-
-        # Get base learner predictions
-        base_predictions = []
-        for learner_name in self.selected_base_learners:
-            learner = self.trained_base_learners[learner_name]
-            pred = learner.predict(X_selected)
-            base_predictions.append(pred)
-
-        # Meta learner final prediction
-        meta_features = np.column_stack(base_predictions)
-        final_prediction = self.trained_meta_learner.predict(meta_features)
-
-        return final_prediction
-
     def predict(self, X):
         """
-        Make predictions using the trained DOME model
-
-        Parameters:
-        -----------
-        X : pandas.DataFrame
-            Input features (should have same columns as training data)
-
-        Returns:
-        --------
-        numpy.ndarray : Predictions
+        Predict susceptibility values for new samples.
         """
-        # Check if model is fitted
         if not self.is_fitted:
-            raise ValueError("Model must be fitted before making predictions. Call fit() first.")
-
-        # Check feature consistency
-        if not all(col in X.columns for col in self.selected_features):
-            missing_features = [col for col in self.selected_features if col not in X.columns]
-            raise ValueError(f"Missing features in input data: {missing_features}")
-
+            raise ValueError("Model must be fitted before prediction. Call fit() first.")
         return self._predict_internal(X)
 
     def get_feature_importance(self):
-        """Get feature importance scores"""
+        """
+        Return selected-feature importance/weight dictionary.
+        """
         if not self.is_fitted:
             raise ValueError("Model must be fitted before getting feature importance.")
 
-        importance_dict = {}
-        for i, feature in enumerate(self.selected_features):
-            importance_dict[feature] = self.feature_weights[i]
-
-        return importance_dict
-
-    def get_model_summary(self):
-        """Get comprehensive model summary"""
-        if not self.is_fitted:
-            raise ValueError("Model must be fitted before getting summary.")
-
-        summary = {
-            'model_type': 'DOME (Dynamic Optimization Meta-Ensemble)',
-            'selected_base_learners': self.selected_base_learners,
-            'selected_meta_learner': self.selected_meta_learner,
-            'learner_weights': self.learner_weights.tolist(),
-            'selected_features': self.selected_features,
-            'feature_weights': self.feature_weights.tolist(),
-            'total_selected_features': len(self.selected_features),
-            'hyperparameters': {
-                'alpha': self.alpha,
-                'beta': self.beta,
-                'gamma': self.gamma,
-                'random_state': self.random_state
-            }
+        return {
+            feature: float(weight)
+            for feature, weight in zip(self.selected_features, self.feature_weights)
         }
 
-        return summary
+    def get_model_summary(self):
+        """
+        Return model configuration and fitted summary.
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before requesting summary.")
+
+        return {
+            "model_type": "DOME (Dynamic Optimization Meta-Ensemble)",
+            "application": "Inventory-based regional debris-flow susceptibility assessment",
+            "selected_base_learners": self.selected_base_learners,
+            "selected_meta_learner": self.selected_meta_learner,
+            "candidate_base_learners": self.candidate_base_learners_,
+            "learner_weights": self.learner_weights.tolist() if self.learner_weights is not None else None,
+            "selected_features": self.selected_features,
+            "feature_weights": self.feature_weights.tolist() if self.feature_weights is not None else None,
+            "optimization_fitness": self.optimization_fitness_,
+            "hyperparameters": {
+                "alpha": self.alpha,
+                "beta": self.beta,
+                "gamma": self.gamma,
+                "random_state": self.random_state,
+                "cv_splits": self.cv_splits,
+                "test_size": self.test_size,
+                "n_candidate_base": self.n_candidate_base,
+                "n_selected_base": self.n_selected_base,
+                "gcra_population_size": self.gcra_population_size,
+                "gcra_max_iterations": self.gcra_max_iterations
+            },
+            "shap_available": SHAP_AVAILABLE,
+            "last_metrics": self.last_metrics
+        }
+
+    # ------------------------------------------------------------------
+    # SHAP interpretation
+    # ------------------------------------------------------------------
+    def _predict_selected_scaled_array(self, X_array):
+        """
+        Wrapper for SHAP KernelExplainer.
+        Input is assumed to already be in the scaled selected-feature space.
+        """
+        X_df = pd.DataFrame(X_array, columns=self.selected_features)
+        return self._predict_from_selected_scaled(X_df)
+
+    def get_shap_explanations(self, X, background_size=50, explain_size=None, nsamples="auto"):
+        """
+        Compute model-agnostic SHAP explanations in the selected scaled-feature space.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            Raw input dataframe.
+        background_size : int
+            Number of background samples for KernelExplainer.
+        explain_size : int or None
+            Number of rows to explain. If None, explain all rows in X.
+        nsamples : int or "auto"
+            SHAP sampling budget.
+
+        Returns
+        -------
+        dict
+            {
+              "summary": pandas.DataFrame,
+              "shap_values": np.ndarray,
+              "expected_value": float,
+              "feature_names": list
+            }
+        """
+        if not SHAP_AVAILABLE:
+            raise ImportError(
+                "The 'shap' package is not installed. "
+                "Run `pip install shap` to enable SHAP-based interpretation."
+            )
+
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before SHAP explanation.")
+
+        X_selected_scaled = self.transform_selected_features(X)
+
+        if len(X_selected_scaled) == 0:
+            raise ValueError("No samples available for SHAP explanation.")
+
+        background_n = max(1, min(int(background_size), len(X_selected_scaled)))
+        explain_n = len(X_selected_scaled) if explain_size is None else max(1, min(int(explain_size), len(X_selected_scaled)))
+
+        background_df = X_selected_scaled.sample(
+            n=background_n,
+            random_state=self.random_state
+        )
+        explain_df = X_selected_scaled.iloc[:explain_n].copy()
+
+        explainer = shap.KernelExplainer(
+            self._predict_selected_scaled_array,
+            background_df.values
+        )
+
+        shap_values = explainer.shap_values(
+            explain_df.values,
+            nsamples=nsamples
+        )
+
+        # For regression, shap_values is usually a 2D array.
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+
+        shap_values = np.asarray(shap_values, dtype=float)
+        mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+
+        summary_df = pd.DataFrame({
+            "feature": self.selected_features,
+            "mean_abs_shap": mean_abs_shap
+        }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+        expected_value = explainer.expected_value
+        if isinstance(expected_value, (list, np.ndarray)):
+            expected_value = float(np.asarray(expected_value).reshape(-1)[0])
+        else:
+            expected_value = float(expected_value)
+
+        self.shap_summary_ = summary_df
+
+        return {
+            "summary": summary_df,
+            "shap_values": shap_values,
+            "expected_value": expected_value,
+            "feature_names": self.selected_features
+        }
 
 
 def main():
-    """Example usage of DOME model"""
-    print("DOME Model - Example Usage")
+    """
+    Example usage.
+    """
+    print("DOME Example")
     print("=" * 40)
 
-    # Load sample data (replace with your dataset)
     try:
-        df = pd.read_excel('CPEC_debris_flow_dataset_3447.xlsx')
-        print(f"Dataset loaded: {df.shape[0]} samples, {df.shape[1]} features")
+        df = pd.read_excel("CPEC_debris_flow_dataset_3447.xlsx")
+        target_col = resolve_target_column(df)
+        print(f"Detected target column: {target_col}")
+        print(f"Dataset loaded: {df.shape[0]} samples, {df.shape[1]} columns")
 
-        # Prepare data
-        X = df.drop('Risk_index', axis=1)
-        y = df['Risk_index']
+        X = df.drop(columns=[target_col])
+        y = df[target_col]
 
-        # Initialize and train DOME model
-        dome_model = DOMEModel(alpha=0.34, beta=0.04, gamma=0.01)
-        results = dome_model.fit(X, y)
+        model = DOMEModel(
+            alpha=0.34,
+            beta=0.04,
+            gamma=0.01,
+            random_state=42,
+            cv_splits=5,
+            verbose=True
+        )
 
-        # Display results
-        print("\nTraining Results:")
+        results = model.fit(X, y)
+
+        print("\nTraining Results")
+        print("-" * 40)
         print(f"Selected base learners: {results['selected_base_learners']}")
         print(f"Selected meta learner: {results['selected_meta_learner']}")
-        print(f"Performance metrics: {results['performance_metrics']}")
+        print(f"Metrics: {results['performance_metrics']}")
 
-        # Make sample predictions
         sample_X = X.head(5)
-        predictions = dome_model.predict(sample_X)
+        predictions = model.predict(sample_X)
         print(f"\nSample predictions: {predictions}")
 
+        if SHAP_AVAILABLE:
+            print("\nGenerating SHAP summary on a small sample...")
+            shap_result = model.get_shap_explanations(
+                X.head(min(30, len(X))),
+                background_size=min(15, len(X)),
+                explain_size=min(15, len(X)),
+                nsamples=50
+            )
+            print(shap_result["summary"].head())
+        else:
+            print("\nSHAP not installed; skipping SHAP summary.")
+
     except FileNotFoundError:
-        print("Dataset file not found. Please ensure 'CPEC_debris_flow_dataset_3447.xlsx' is available.")
+        print("Dataset file not found: CPEC_debris_flow_dataset_3447.xlsx")
     except Exception as e:
         print(f"Error: {e}")
 
